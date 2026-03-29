@@ -4,7 +4,6 @@ import time
 import logging
 import asyncio
 import threading
-import queue
 import re
 import uuid
 from threading import Lock
@@ -42,7 +41,6 @@ API_HASH = '56f64582b363d367280db96586b97801'
 
 
 def parse_entities(raw_text):
-    """استخراج معرفات/روابط المجموعات من نص مختلط تلقائياً"""
     entities = []
     found_raw = set()
 
@@ -52,26 +50,19 @@ def parse_entities(raw_text):
             found_raw.add(k)
             entities.append(val)
 
-    # روابط دعوة t.me/+HASH
     for m in re.findall(r'https?://t\.me/\+([A-Za-z0-9_-]+)', raw_text):
         add(f"+{m}")
-    # روابط joinchat
     for m in re.findall(r'https?://t\.me/joinchat/([A-Za-z0-9_-]+)', raw_text):
         add(m)
-    # روابط t.me/username عادية
     for m in re.findall(r'https?://t\.me/([A-Za-z][A-Za-z0-9_]{3,})', raw_text):
         add(m)
-    # t.me مختصرة بدون http
     for m in re.findall(r'(?<![/\w@])t\.me/\+?([A-Za-z0-9_-]{4,})', raw_text):
         add(m)
-    # @username
     for m in re.findall(r'@([A-Za-z0-9_]{5,})', raw_text):
         add(m)
-    # معرفات رقمية (chat IDs) مثل -100xxxxxxxx
     for m in re.findall(r'(?<!\d)(-100\d{9,})(?!\d)', raw_text):
         add(m)
 
-    # إذا لا يوجد شيء مستخرج بالأنماط، قسّم بأي فاصل
     if not entities:
         for part in re.split(r'[\n,،\s|؛;/\\]+', raw_text):
             p = part.strip().lstrip('@')
@@ -82,7 +73,6 @@ def parse_entities(raw_text):
 
 
 def parse_keywords(raw_text):
-    """استخراج كلمات المراقبة من نص مختلط"""
     seen = set()
     kws = []
     for kw in re.split(r'[\n,،|؛;]+', raw_text):
@@ -91,6 +81,7 @@ def parse_keywords(raw_text):
             seen.add(kw.lower())
             kws.append(kw)
     return kws
+
 
 PREDEFINED_USERS = {
     "user_1": {"id": "user_1", "name": "المستخدم الأول", "icon": "fas fa-user", "color": "#5865f2"},
@@ -131,7 +122,7 @@ class UserData:
         self.user_id = user_id
         self.client_manager = None
         self.settings = {}
-        self.stats = {"sent": 0, "errors": 0, "alerts": 0}
+        self.stats = {"sent": 0, "errors": 0, "alerts": 0, "replies": 0}
         self.connected = False
         self.authenticated = False
         self.awaiting_code = False
@@ -142,9 +133,8 @@ class UserData:
         self.thread = None
         self.phone_number = None
         self.auto_replies = []
-        # سجل الرسائل المُرسلة جماعياً في الجلسة الحالية
-        # [{id, text, has_media, sent_at, entries:[{chat_id,msg_id,chat_title}]}]
         self.sent_batches = []
+        self.telegram_name = None
 
 
 class TelegramClientManager:
@@ -158,6 +148,7 @@ class TelegramClientManager:
         self.event_handlers_registered = False
         self.scheduled_thread = None
         self.scheduled_stop = threading.Event()
+        self.keep_alive_task = None
 
     def start_client_thread(self):
         if self.thread and self.thread.is_alive():
@@ -166,13 +157,11 @@ class TelegramClientManager:
         self.is_ready.clear()
         self.thread = threading.Thread(target=self._run_client_loop, daemon=True)
         self.thread.start()
-        return self.is_ready.wait(timeout=30)
+        return self.is_ready.wait(timeout=45)
 
     def _run_client_loop(self):
         try:
-            from telethon import TelegramClient, events
-            from telethon.sessions import StringSession
-
+            from telethon import TelegramClient
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
@@ -193,58 +182,78 @@ class TelegramClientManager:
                 self.loop.close()
 
     async def _client_main(self):
-        try:
-            await self.client.connect()
-            self.is_ready.set()
+        retries = 3
+        for attempt in range(retries):
+            try:
+                await self.client.connect()
+                self.is_ready.set()
+                logger.info(f"✅ {self.user_id} connected (attempt {attempt+1})")
 
-            if await self.client.is_user_authorized():
-                with USERS_LOCK:
-                    ud = USERS.get(self.user_id)
-                    if ud:
-                        ud.authenticated = True
-                        ud.connected = True
-                await self._register_event_handlers()
-                logger.info(f"✅ {self.user_id} auto-authorized")
-
-            check_counter = 0
-            while not self.stop_flag.is_set():
-                await asyncio.sleep(1)
-                check_counter += 1
-                # فحص صلاحية الجلسة كل 30 ثانية
-                if check_counter >= 30:
-                    check_counter = 0
+                if await self.client.is_user_authorized():
                     with USERS_LOCK:
                         ud = USERS.get(self.user_id)
-                        was_auth = ud.authenticated if ud else False
-                    if was_auth:
-                        try:
-                            still_auth = await self.client.is_user_authorized()
-                            if not still_auth:
-                                logger.warning(f"⚠️ {self.user_id} session no longer valid")
-                                await self._handle_session_revoked()
-                                break
-                        except Exception as check_err:
-                            err_str = str(check_err)
-                            if any(k in err_str for k in ['AuthKey', 'Unauthorized', 'revoked', 'AUTH_KEY']):
-                                await self._handle_session_revoked()
-                                break
+                        if ud:
+                            ud.authenticated = True
+                            ud.connected = True
+                            me = await self.client.get_me()
+                            name = (me.first_name or '') + (' ' + (me.last_name or '') if me.last_name else '')
+                            if not name.strip() and me.username:
+                                name = f"@{me.username}"
+                            elif not name.strip():
+                                name = me.phone or str(me.id)
+                            ud.telegram_name = name
+                    await self._register_event_handlers()
+                    self.keep_alive_task = asyncio.create_task(self._keep_alive())
+                    logger.info(f"✅ {self.user_id} auto-authorized")
+                    return
 
-        except Exception as e:
-            err_str = str(e)
-            if any(k in err_str for k in ['AuthKeyUnregistered', 'AuthKeyInvalid', 'UserDeactivated', 'AUTH_KEY_UNREGISTERED', 'SESSION_REVOKED']):
-                logger.warning(f"🔴 {self.user_id} auth key error: {e}")
-                await self._handle_session_revoked()
-            else:
-                logger.error(f"Client main error: {e}")
-        finally:
-            if self.client:
-                try:
-                    await self.client.disconnect()
-                except:
-                    pass
+                check_counter = 0
+                while not self.stop_flag.is_set():
+                    await asyncio.sleep(1)
+                    check_counter += 1
+                    if check_counter >= 30:
+                        check_counter = 0
+                        with USERS_LOCK:
+                            ud = USERS.get(self.user_id)
+                            was_auth = ud.authenticated if ud else False
+                        if was_auth:
+                            try:
+                                still_auth = await self.client.is_user_authorized()
+                                if not still_auth:
+                                    logger.warning(f"⚠️ {self.user_id} session no longer valid")
+                                    await self._handle_session_revoked()
+                                    break
+                            except Exception as check_err:
+                                err_str = str(check_err)
+                                if any(k in err_str for k in ['AuthKey', 'Unauthorized', 'revoked', 'AUTH_KEY']):
+                                    await self._handle_session_revoked()
+                                    break
+                return
+
+            except Exception as e:
+                logger.error(f"Client main error (attempt {attempt+1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(3)
+                else:
+                    self.is_ready.set()
+                    raise
+            finally:
+                if self.client:
+                    try:
+                        await self.client.disconnect()
+                    except:
+                        pass
+
+    async def _keep_alive(self):
+        while not self.stop_flag.is_set():
+            try:
+                await self.client.get_me()
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.warning(f"Keep-alive error for {self.user_id}: {e}")
+                await asyncio.sleep(10)
 
     async def _handle_session_revoked(self):
-        """معالجة إلغاء الجلسة من تيليجرام"""
         logger.info(f"🔴 Session revoked for {self.user_id}")
         with USERS_LOCK:
             ud = USERS.get(self.user_id)
@@ -255,98 +264,62 @@ class TelegramClientManager:
                 ud.awaiting_password = False
                 ud.monitoring_active = False
                 ud.is_running = False
+                ud.telegram_name = None
 
-        # حذف ملفات الجلسة
         for suffix in ['_session', '_session.session']:
             path = os.path.join(SESSIONS_DIR, f"{self.user_id}{suffix}")
             if os.path.exists(path):
                 try:
                     os.remove(path)
-                    logger.info(f"Removed: {path}")
-                except Exception as rm_err:
-                    logger.warning(f"Cannot remove {path}: {rm_err}")
+                except:
+                    pass
 
-        # تحديث الإعدادات المحفوظة
         settings = load_settings(self.user_id)
         settings.pop('phone', None)
         save_settings(self.user_id, settings)
 
-        # إشعار الواجهة الأمامية
-        socketio.emit('session_revoked', {
-            "message": "⚠️ تم إلغاء الجلسة من تيليجرام - يرجى تسجيل الدخول مجدداً"
-        }, to=self.user_id)
-        socketio.emit('log_update', {
-            "message": "🔴 الجلسة أُلغيت من تيليجرام - تم قطع الاتصال تلقائياً"
-        }, to=self.user_id)
-
+        socketio.emit('session_revoked', {"message": "⚠️ تم إلغاء الجلسة - يرجى تسجيل الدخول مجدداً"}, to=self.user_id)
+        socketio.emit('log_update', {"message": "🔴 الجلسة أُلغيت من تيليجرام"}, to=self.user_id)
         self.stop_flag.set()
 
     async def _start_code_listener(self):
-        """مراقبة كود التحقق القادم من تيليجرام (777000) وإرساله للواجهة تلقائياً"""
         try:
-            from telethon import events as telethon_events
-            from telethon.tl.types import UpdateServiceNotification
-
+            from telethon import events
             code_found = asyncio.Event()
-            # نمط يطابق 5 أو 6 أرقام (أكواد تيليجرام)
             CODE_PATTERN = re.compile(r'\b(\d{5,6})\b')
 
-            def _emit_code(code):
-                code_found.set()
-                socketio.emit('auto_code', {'code': code}, to=self.user_id)
-                socketio.emit('log_update', {
-                    'message': f'📩 تم استلام كود التحقق ({code}) تلقائياً'
-                }, to=self.user_id)
-                logger.info(f"Auto-code sent for {self.user_id}: {code}")
-
-            # مستمع 1: Service Notifications (تعمل قبل تسجيل الدخول)
-            @self.client.on(telethon_events.Raw(UpdateServiceNotification))
-            async def service_notif_handler(update):
+            def emit_code(code):
                 if code_found.is_set():
                     return
-                text = getattr(update, 'message', '') or ''
-                logger.info(f"ServiceNotif for {self.user_id}: {text[:80]}")
-                match = CODE_PATTERN.search(text)
-                if match:
-                    _emit_code(match.group(1))
+                code_found.set()
+                socketio.emit('auto_code', {'code': code}, to=self.user_id)
+                socketio.emit('log_update', {'message': f'📩 تم استلام كود التحقق ({code}) تلقائياً'}, to=self.user_id)
+                logger.info(f"Auto-code for {self.user_id}: {code}")
 
-            # مستمع 2: رسائل مباشرة من رقم خدمة تيليجرام
-            @self.client.on(telethon_events.NewMessage(from_users=777000))
-            async def telegram_svc_handler(event):
+            @self.client.on(events.NewMessage)
+            async def catch_all(event):
                 if code_found.is_set():
                     return
                 text = event.message.message or ''
-                logger.info(f"Msg from 777000 for {self.user_id}: {text[:80]}")
                 match = CODE_PATTERN.search(text)
                 if match:
-                    _emit_code(match.group(1))
-
-            # مستمع 3: أي رسالة تحتوي على كلمة "login code" أو "كود"
-            @self.client.on(telethon_events.NewMessage())
-            async def any_code_handler(event):
-                if code_found.is_set():
-                    return
-                text = (event.message.message or '').lower()
-                if 'login code' in text or 'your code' in text or 'verification' in text:
-                    match = CODE_PATTERN.search(text)
+                    emit_code(match.group(1))
+                if event.message.media and hasattr(event.message, 'caption') and event.message.caption:
+                    match = CODE_PATTERN.search(event.message.caption)
                     if match:
-                        _emit_code(match.group(1))
+                        emit_code(match.group(1))
 
-            # انتظر حتى 120 ثانية
-            await asyncio.wait_for(code_found.wait(), timeout=120)
+            await asyncio.wait_for(code_found.wait(), timeout=90)
 
         except asyncio.TimeoutError:
             logger.info(f"Code listener timeout for {self.user_id}")
+            socketio.emit('log_update', {'message': '⏰ لم يتم استلام الكود تلقائياً - الرجاء إدخاله يدوياً'}, to=self.user_id)
         except Exception as e:
-            logger.error(f"Code listener error for {self.user_id}: {e}")
+            logger.error(f"Code listener error: {e}")
         finally:
             try:
-                self.client.remove_event_handler(service_notif_handler)
-            except Exception:
-                pass
-            try:
-                self.client.remove_event_handler(telegram_svc_handler)
-            except Exception:
+                self.client.remove_event_handler(catch_all)
+            except:
                 pass
 
     async def _register_event_handlers(self):
@@ -374,7 +347,6 @@ class TelegramClientManager:
             chat_username = getattr(chat, 'username', None)
             chat_id = getattr(chat, 'id', None)
 
-            # بناء رابط المجموعة
             if chat_username:
                 group_link = f"https://t.me/{chat_username}"
             elif chat_id:
@@ -388,13 +360,11 @@ class TelegramClientManager:
                     return
                 monitoring = ud.monitoring_active
                 auto_replies = list(ud.auto_replies or [])
-                # قراءة الإعدادات الحديثة من الذاكرة
                 current_settings = dict(ud.settings)
 
             msg_text = event.message.text
             msg_lower = msg_text.lower()
 
-            # وقت الرسالة من تيليجرام
             msg_date = event.message.date
             if msg_date:
                 try:
@@ -407,16 +377,13 @@ class TelegramClientManager:
 
             if monitoring:
                 watch_words = current_settings.get('watch_words', [])
-                # إعادة قراءة من الملف للتأكد من الكلمات الحديثة
                 if not watch_words:
                     fresh = load_settings(self.user_id)
                     watch_words = fresh.get('watch_words', [])
 
-                # تطبيع نص الرسالة لتسهيل المطابقة
                 msg_normalized = ' '.join(msg_text.split()).lower()
 
                 for kw in watch_words:
-                    # تطبيع الكلمة المراقبة (إزالة المسافات والأسطر الزائدة)
                     kw_clean = ' '.join(kw.split()).lower() if kw else ''
                     if kw_clean and (kw_clean in msg_normalized or kw_clean in msg_lower):
                         sender = await event.get_sender()
@@ -427,7 +394,6 @@ class TelegramClientManager:
                         sender_name = (f"{sender_first} {sender_last}".strip()
                                        or sender_username or str(sender_id) or 'غير معروف')
 
-                        # رابط المرسل
                         if sender_username:
                             sender_link = f"https://t.me/{sender_username}"
                         elif sender_id:
@@ -436,20 +402,13 @@ class TelegramClientManager:
                             sender_link = None
 
                         alert = {
-                            "keyword": kw,
-                            "group": chat_title,
-                            "group_link": group_link,
-                            "group_username": chat_username,
-                            "group_id": chat_id,
-                            "message": msg_text[:500],
-                            "full_message": msg_text,
-                            "sender": sender_name,
-                            "sender_id": sender_id,
-                            "sender_username": sender_username,
-                            "sender_link": sender_link,
+                            "keyword": kw, "group": chat_title, "group_link": group_link,
+                            "group_username": chat_username, "group_id": chat_id,
+                            "message": msg_text[:500], "full_message": msg_text,
+                            "sender": sender_name, "sender_id": sender_id,
+                            "sender_username": sender_username, "sender_link": sender_link,
                             "timestamp": datetime.now().strftime('%H:%M:%S'),
-                            "message_time": msg_time_str,
-                            "message_id": event.message.id
+                            "message_time": msg_time_str, "message_id": event.message.id
                         }
 
                         with USERS_LOCK:
@@ -459,25 +418,18 @@ class TelegramClientManager:
                                 socketio.emit('stats_update', dict(ud2.stats), to=self.user_id)
 
                         socketio.emit('new_alert', alert, to=self.user_id)
-                        socketio.emit('log_update', {
-                            "message": f"🚨 تنبيه: '{kw}' في [{chat_title}] من [{sender_name}]"
-                        }, to=self.user_id)
+                        socketio.emit('log_update', {"message": f"🚨 تنبيه: '{kw}' في [{chat_title}] من [{sender_name}]"}, to=self.user_id)
 
                         try:
                             sender_ref = f"@{sender_username}" if sender_username else sender_name
                             group_ref = f"@{chat_username}" if chat_username else chat_title
                             kw_display = kw[:150] + ('...' if len(kw) > 150 else '')
-                            notif = (f"🚨 تنبيه كلمة: {kw_display}\n"
-                                     f"📍 المجموعة: {group_ref}\n"
-                                     f"👤 المرسل: {sender_ref} (ID: {sender_id})\n"
-                                     f"⏰ الوقت: {msg_time_str}\n"
-                                     f"💬 الرسالة:\n{msg_text[:300]}")
+                            notif = (f"🚨 تنبيه كلمة: {kw_display}\n📍 المجموعة: {group_ref}\n👤 المرسل: {sender_ref}\n⏰ الوقت: {msg_time_str}\n💬 الرسالة:\n{msg_text[:300]}")
                             notif = notif[:4000]
                             await self.client.send_message('me', notif)
                         except Exception:
                             pass
 
-            # إعادة قراءة قواعد الرد التلقائي من القرص لضمان حداثتها
             fresh_rules = load_settings(self.user_id)
             live_auto_replies = fresh_rules.get('auto_replies', auto_replies)
             if not live_auto_replies:
@@ -486,51 +438,37 @@ class TelegramClientManager:
             for rule in live_auto_replies:
                 kw = (rule.get('keyword', '') or '').strip()
                 reply_text = (rule.get('reply', '') or '').strip()
-                # تطبيع الكلمة المفتاحية: إزالة الأسطر والمسافات الزائدة
                 kw_clean = ' '.join(kw.split()).lower() if kw else ''
                 msg_norm = ' '.join(msg_text.split()).lower()
-                # مطابقة مرنة: تعمل مع الكلمات الصغيرة والكبيرة سواء
                 if kw_clean and reply_text and (kw_clean in msg_norm or kw_clean in msg_lower):
                     try:
                         sender = await event.get_sender()
                         sender_name = getattr(sender, 'first_name', '') or getattr(sender, 'username', '') or 'مستخدم'
 
-                        # إرسال الرد مقسّماً إذا كان أطول من 4096 حرف (حد تيليجرام)
                         MAX_TG = 4096
                         if len(reply_text) <= MAX_TG:
                             await event.message.reply(reply_text)
                         else:
-                            # الجزء الأول كرد على الرسالة
                             await event.message.reply(reply_text[:MAX_TG])
-                            # باقي الأجزاء كرسائل متتابعة في نفس المحادثة
                             for chunk_start in range(MAX_TG, len(reply_text), MAX_TG):
                                 await asyncio.sleep(0.5)
-                                await self.client.send_message(
-                                    await event.get_chat(),
-                                    reply_text[chunk_start:chunk_start + MAX_TG]
-                                )
+                                await self.client.send_message(await event.get_chat(), reply_text[chunk_start:chunk_start+MAX_TG])
 
                         with USERS_LOCK:
                             ud2 = USERS.get(self.user_id)
                             if ud2:
                                 ud2.stats['replies'] = ud2.stats.get('replies', 0) + 1
                                 socketio.emit('stats_update', dict(ud2.stats), to=self.user_id)
+
                         socketio.emit('auto_reply_event', {
-                            "sender": sender_name,
-                            "chat": chat_title,
-                            "original_msg": msg_text[:300],
-                            "reply_msg": reply_text[:300],
-                            "keyword": kw,
-                            "timestamp": datetime.now().strftime('%H:%M:%S')
+                            "sender": sender_name, "chat": chat_title,
+                            "original_msg": msg_text[:300], "reply_msg": reply_text[:300],
+                            "keyword": kw, "timestamp": datetime.now().strftime('%H:%M:%S')
                         }, to=self.user_id)
-                        socketio.emit('log_update', {
-                            "message": f"🤖 رد على [{sender_name}] في [{chat_title}] | كلمة: '{kw[:30]}'"
-                        }, to=self.user_id)
+                        socketio.emit('log_update', {"message": f"🤖 رد على [{sender_name}] في [{chat_title}] | كلمة: '{kw[:30]}'"}, to=self.user_id)
                     except Exception as e:
                         logger.error(f"Auto-reply send error: {e}")
-                        socketio.emit('log_update', {
-                            "message": f"❌ فشل الرد التلقائي: {str(e)[:100]}"
-                        }, to=self.user_id)
+                        socketio.emit('log_update', {"message": f"❌ فشل الرد التلقائي: {str(e)[:100]}"}, to=self.user_id)
                     break
         except Exception as e:
             logger.error(f"Handle message error: {e}")
@@ -544,6 +482,8 @@ class TelegramClientManager:
     def stop(self):
         self.stop_flag.set()
         self.scheduled_stop.set()
+        if self.keep_alive_task:
+            self.keep_alive_task.cancel()
 
     def start_scheduled(self, groups, message, image_path, interval_minutes):
         self.scheduled_stop.clear()
@@ -559,12 +499,19 @@ class TelegramClientManager:
 
     def _scheduled_worker(self, groups, message, image_path, interval_minutes):
         socketio.emit('log_update', {"message": f"📅 بدأ الإرسال المجدول كل {interval_minutes} دقيقة"}, to=self.user_id)
+        # إرسال الدفعة الأولى فوراً
+        try:
+            self.run_coroutine(self._send_to_groups(groups, message, image_path))
+        except Exception as e:
+            logger.error(f"Scheduled send error (first batch): {e}")
+        # ثم التكرار
         while not self.scheduled_stop.is_set():
-            try:
-                self.run_coroutine(self._send_to_groups(groups, message, image_path))
-            except Exception as e:
-                logger.error(f"Scheduled send error: {e}")
             self.scheduled_stop.wait(timeout=interval_minutes * 60)
+            if not self.scheduled_stop.is_set():
+                try:
+                    self.run_coroutine(self._send_to_groups(groups, message, image_path))
+                except Exception as e:
+                    logger.error(f"Scheduled send error: {e}")
         socketio.emit('log_update', {"message": "⏹ تم إيقاف الإرسال المجدول"}, to=self.user_id)
 
     async def _send_to_groups(self, groups, message, image_path):
@@ -574,7 +521,7 @@ class TelegramClientManager:
         total = len(groups)
         batch_id = str(uuid.uuid4())
         has_media = bool(image_path and os.path.exists(image_path))
-        batch_entries = []  # [{chat_id, msg_id, chat_title, chat_username}]
+        batch_entries = []
 
         socketio.emit('log_update', {"message": f"📤 بدء الإرسال إلى {total} مجموعة..."}, to=self.user_id)
 
@@ -583,7 +530,6 @@ class TelegramClientManager:
                 entity_str = group.strip()
                 chat = None
 
-                # رابط دعوة خاص +HASH
                 if entity_str.startswith('+') and len(entity_str) > 8:
                     try:
                         result = await self.client(functions.messages.ImportChatInviteRequest(hash=entity_str[1:]))
@@ -591,7 +537,7 @@ class TelegramClientManager:
                     except Exception as je:
                         if 'Already' in str(je) or 'USER_ALREADY' in str(je):
                             async for dialog in self.client.iter_dialogs():
-                                if hasattr(dialog.entity, 'username'):
+                                if hasattr(dialog.entity, 'username') and dialog.entity.username == entity_str:
                                     chat = dialog.entity
                                     break
                         else:
@@ -619,13 +565,10 @@ class TelegramClientManager:
                 chat_id = getattr(chat, 'id', None)
                 msg_id = sent_msg.id if sent_msg else None
 
-                # حفظ معرّف الرسالة للتعديل/الحذف لاحقاً
                 if chat_id and msg_id:
                     batch_entries.append({
-                        "chat_id": chat_id,
-                        "msg_id": msg_id,
-                        "chat_title": chat_name,
-                        "chat_username": chat_username,
+                        "chat_id": chat_id, "msg_id": msg_id,
+                        "chat_title": chat_name, "chat_username": chat_username,
                         "entity_str": entity_str
                     })
 
@@ -647,30 +590,22 @@ class TelegramClientManager:
                         socketio.emit('stats_update', dict(ud.stats), to=self.user_id)
                 await asyncio.sleep(1)
 
-        # حفظ الدُّفعة في سجل الجلسة
         if batch_entries:
             batch_record = {
-                "id": batch_id,
-                "text": message or "",
-                "has_media": has_media,
+                "id": batch_id, "text": message or "", "has_media": has_media,
                 "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "sent_count": sent,
-                "entries": batch_entries
+                "sent_count": sent, "entries": batch_entries
             }
             with USERS_LOCK:
                 ud = USERS.get(self.user_id)
                 if ud:
                     ud.sent_batches.append(batch_record)
-            # إشعار الفرونت إند بالدُّفعة الجديدة
             socketio.emit('batch_saved', batch_record, to=self.user_id)
 
-        socketio.emit('log_update', {
-            "message": f"📊 اكتمل الإرسال: ✅ {sent} ناجح  ❌ {errors} فاشل  من أصل {total}"
-        }, to=self.user_id)
+        socketio.emit('log_update', {"message": f"📊 اكتمل الإرسال: ✅ {sent} ناجح  ❌ {errors} فاشل  من أصل {total}"}, to=self.user_id)
         socketio.emit('send_complete', {"sent": sent, "errors": errors, "total": total}, to=self.user_id)
 
     async def _edit_batch_messages(self, batch_id, new_text):
-        """تعديل جميع رسائل دُفعة في كل المجموعات"""
         with USERS_LOCK:
             ud = USERS.get(self.user_id)
             if not ud:
@@ -684,21 +619,14 @@ class TelegramClientManager:
         fail_count = 0
         for entry in batch["entries"]:
             try:
-                chat_id = entry["chat_id"]
-                msg_id = entry["msg_id"]
-                await self.client.edit_message(chat_id, msg_id, new_text)
+                await self.client.edit_message(entry["chat_id"], entry["msg_id"], new_text)
                 ok_count += 1
-                socketio.emit('log_update', {
-                    "message": f"✏️ تم تعديل الرسالة في {entry['chat_title']}"
-                }, to=self.user_id)
+                socketio.emit('log_update', {"message": f"✏️ تم تعديل الرسالة في {entry['chat_title']}"}, to=self.user_id)
                 await asyncio.sleep(0.5)
             except Exception as e:
                 fail_count += 1
-                socketio.emit('log_update', {
-                    "message": f"❌ فشل التعديل في {entry.get('chat_title','?')}: {str(e)[:60]}"
-                }, to=self.user_id)
+                socketio.emit('log_update', {"message": f"❌ فشل التعديل في {entry.get('chat_title','?')}: {str(e)[:60]}"}, to=self.user_id)
 
-        # تحديث النص في السجل
         with USERS_LOCK:
             ud = USERS.get(self.user_id)
             if ud:
@@ -708,14 +636,10 @@ class TelegramClientManager:
                         b["edited_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         break
 
-        socketio.emit('batch_edited', {
-            "batch_id": batch_id, "new_text": new_text,
-            "ok": ok_count, "fail": fail_count
-        }, to=self.user_id)
+        socketio.emit('batch_edited', {"batch_id": batch_id, "new_text": new_text, "ok": ok_count, "fail": fail_count}, to=self.user_id)
         return {"ok": True, "edited": ok_count, "failed": fail_count}
 
     async def _delete_batch_messages(self, batch_id):
-        """حذف جميع رسائل دُفعة من كل المجموعات"""
         with USERS_LOCK:
             ud = USERS.get(self.user_id)
             if not ud:
@@ -729,29 +653,20 @@ class TelegramClientManager:
         fail_count = 0
         for entry in batch["entries"]:
             try:
-                chat_id = entry["chat_id"]
-                msg_id = entry["msg_id"]
-                await self.client.delete_messages(chat_id, [msg_id])
+                await self.client.delete_messages(entry["chat_id"], [entry["msg_id"]])
                 ok_count += 1
-                socketio.emit('log_update', {
-                    "message": f"🗑️ تم حذف الرسالة من {entry['chat_title']}"
-                }, to=self.user_id)
+                socketio.emit('log_update', {"message": f"🗑️ تم حذف الرسالة من {entry['chat_title']}"}, to=self.user_id)
                 await asyncio.sleep(0.5)
             except Exception as e:
                 fail_count += 1
-                socketio.emit('log_update', {
-                    "message": f"❌ فشل الحذف من {entry.get('chat_title','?')}: {str(e)[:60]}"
-                }, to=self.user_id)
+                socketio.emit('log_update', {"message": f"❌ فشل الحذف من {entry.get('chat_title','?')}: {str(e)[:60]}"}, to=self.user_id)
 
-        # إزالة الدُّفعة من السجل
         with USERS_LOCK:
             ud = USERS.get(self.user_id)
             if ud:
                 ud.sent_batches = [b for b in ud.sent_batches if b["id"] != batch_id]
 
-        socketio.emit('batch_deleted', {
-            "batch_id": batch_id, "ok": ok_count, "fail": fail_count
-        }, to=self.user_id)
+        socketio.emit('batch_deleted', {"batch_id": batch_id, "ok": ok_count, "fail": fail_count}, to=self.user_id)
         return {"ok": True, "deleted": ok_count, "failed": fail_count}
 
 
@@ -782,6 +697,7 @@ def add_no_cache(response):
     response.headers['Expires'] = '0'
     return response
 
+
 @app.route("/")
 def index():
     uid = get_current_user_id()
@@ -793,22 +709,19 @@ def index():
                            predefined_users=PREDEFINED_USERS,
                            current_user_id=uid)
 
+
 @app.route("/sw.js")
 def service_worker():
     sw_content = """
-// Service Worker - Clear all caches
-self.addEventListener('install', event => {
-    self.skipWaiting();
-});
+self.addEventListener('install', event => { self.skipWaiting(); });
 self.addEventListener('activate', event => {
-    event.waitUntil(
-        caches.keys().then(keys => Promise.all(keys.map(key => caches.delete(key))))
-    );
+    event.waitUntil(caches.keys().then(keys => Promise.all(keys.map(key => caches.delete(key)))));
     self.clients.claim();
 });
 """
     from flask import Response
     return Response(sw_content, mimetype='application/javascript')
+
 
 @app.route("/vite-hmr")
 def vite_hmr():
@@ -831,7 +744,8 @@ def api_get_login_status():
         "awaiting_password": ud.awaiting_password,
         "is_running": ud.is_running,
         "phone": ud.phone_number or "",
-        "no_user_selected": False
+        "telegram_name": ud.telegram_name if ud.authenticated else None,
+        "display_name": ud.telegram_name if ud.authenticated else PREDEFINED_USERS[uid]['name']
     })
 
 
@@ -893,7 +807,9 @@ def api_switch_user():
         "logged_in": ud.authenticated,
         "awaiting_code": ud.awaiting_code,
         "awaiting_password": ud.awaiting_password,
-        "is_running": ud.is_running
+        "is_running": ud.is_running,
+        "telegram_name": ud.telegram_name if ud.authenticated else None,
+        "display_name": ud.telegram_name if ud.authenticated else PREDEFINED_USERS[new_uid]['name']
     })
 
 
@@ -904,42 +820,88 @@ def api_save_login():
     phone = data.get('phone', '').strip()
 
     if not phone:
-        return jsonify({"success": False, "message": "أدخل رقم الهاتف"})
+        return jsonify({"success": False, "message": "❌ أدخل رقم الهاتف"})
 
     if not API_ID or not API_HASH:
-        return jsonify({"success": False, "message": "⚠️ TELEGRAM_API_ID و TELEGRAM_API_HASH غير محددة في المتغيرات البيئية"})
+        return jsonify({"success": False, "message": "⚠️ API_ID أو API_HASH غير مضبوط بشكل صحيح"})
 
     try:
-        from telethon.errors import FloodWaitError
+        from telethon.errors import FloodWaitError, RPCError
 
         ud = get_or_create_user(uid)
         socketio.emit('log_update', {"message": "🔄 جارٍ إعداد الاتصال..."}, to=uid)
+
+        # إعادة تعيين العميل إذا كان غير جاهز
+        if ud.client_manager:
+            if not ud.client_manager.is_ready.is_set() or ud.client_manager.stop_flag.is_set():
+                ud.client_manager.stop()
+                ud.client_manager = None
 
         if not ud.client_manager:
             ud.client_manager = TelegramClientManager(uid)
 
         if not ud.client_manager.start_client_thread():
-            return jsonify({"success": False, "message": "❌ فشل في تشغيل العميل"})
+            socketio.emit('log_update', {"message": "❌ فشل الاتصال بالخادم - تأكد من اتصال الإنترنت"}, to=uid)
+            return jsonify({"success": False, "message": "❌ فشل الاتصال بالخادم. تحقق من اتصال الإنترنت وحاول مجدداً"})
 
-        is_auth = ud.client_manager.run_coroutine(ud.client_manager.client.is_user_authorized())
-
-        if is_auth:
-            with USERS_LOCK:
-                ud.authenticated = True
-                ud.connected = True
-                ud.phone_number = phone
-            settings = load_settings(uid)
-            settings['phone'] = phone
-            save_settings(uid, settings)
-            socketio.emit('log_update', {"message": "✅ تم الدخول تلقائياً (جلسة محفوظة)"}, to=uid)
-            return jsonify({"success": True, "message": "✅ أنت مسجل دخول بالفعل", "status": "already_authorized"})
-
-        socketio.emit('log_update', {"message": f"📱 إرسال كود إلى {phone}..."}, to=uid)
+        if not ud.client_manager.client:
+            return jsonify({"success": False, "message": "❌ العميل غير جاهز، حاول مرة أخرى"})
 
         try:
-            sent = ud.client_manager.run_coroutine(ud.client_manager.client.send_code_request(phone))
+            is_auth = ud.client_manager.run_coroutine(ud.client_manager.client.is_user_authorized(), timeout=15)
+        except Exception as auth_err:
+            logger.error(f"Auth check error: {auth_err}")
+            socketio.emit('log_update', {"message": f"⚠️ خطأ في التحقق: {str(auth_err)[:100]}"}, to=uid)
+            return jsonify({"success": False, "message": f"⚠️ خطأ في الاتصال: {str(auth_err)[:100]}"})
+
+        if is_auth:
+            try:
+                me = ud.client_manager.run_coroutine(ud.client_manager.client.get_me(), timeout=15)
+                name = (me.first_name or '') + (' ' + (me.last_name or '') if me.last_name else '')
+                if not name.strip() and me.username:
+                    name = f"@{me.username}"
+                elif not name.strip():
+                    name = me.phone or str(me.id)
+                with USERS_LOCK:
+                    ud.authenticated = True
+                    ud.connected = True
+                    ud.phone_number = phone
+                    ud.telegram_name = name
+                settings = load_settings(uid)
+                settings['phone'] = phone
+                save_settings(uid, settings)
+                socketio.emit('log_update', {"message": "✅ تم الدخول تلقائياً (جلسة محفوظة)"}, to=uid)
+                return jsonify({"success": True, "message": "✅ أنت مسجل دخول بالفعل", "status": "already_authorized", "telegram_name": name})
+            except Exception as me_err:
+                logger.error(f"Get me error: {me_err}")
+                with USERS_LOCK:
+                    ud.authenticated = True
+                    ud.connected = True
+                    ud.phone_number = phone
+                settings = load_settings(uid)
+                settings['phone'] = phone
+                save_settings(uid, settings)
+                socketio.emit('log_update', {"message": "✅ تم الدخول تلقائياً (جلسة محفوظة)"}, to=uid)
+                return jsonify({"success": True, "message": "✅ أنت مسجل دخول بالفعل", "status": "already_authorized"})
+
+        socketio.emit('log_update', {"message": f"📱 إرسال كود إلى {phone}..."}, to=uid)
+        try:
+            sent = ud.client_manager.run_coroutine(ud.client_manager.client.send_code_request(phone), timeout=20)
         except FloodWaitError as e:
-            return jsonify({"success": False, "message": f"⏳ انتظر {e.seconds} ثانية"})
+            wait_time = e.seconds
+            socketio.emit('log_update', {"message": f"⏳ انتظر {wait_time} ثانية ثم حاول مجدداً"}, to=uid)
+            return jsonify({"success": False, "message": f"⏳ انتظر {wait_time} ثانية ثم حاول مجدداً"})
+        except RPCError as rpc_err:
+            err_msg = str(rpc_err)
+            if "PHONE_NUMBER_INVALID" in err_msg:
+                return jsonify({"success": False, "message": "❌ رقم الهاتف غير صالح"})
+            elif "PHONE_NUMBER_FLOOD" in err_msg:
+                return jsonify({"success": False, "message": "⚠️ تم إرسال طلبات كثيرة لهذا الرقم، انتظر بضع دقائق"})
+            else:
+                return jsonify({"success": False, "message": f"❌ خطأ: {err_msg[:100]}"})
+        except Exception as send_err:
+            logger.error(f"Send code error: {send_err}")
+            return jsonify({"success": False, "message": f"❌ فشل إرسال الكود: {str(send_err)[:100]}"})
 
         with USERS_LOCK:
             ud.awaiting_code = True
@@ -951,9 +913,8 @@ def api_save_login():
         settings['phone'] = phone
         save_settings(uid, settings)
 
-        socketio.emit('log_update', {"message": "📱 تم إرسال كود التحقق - جارٍ محاولة الاستلام التلقائي..."}, to=uid)
+        socketio.emit('log_update', {"message": "📱 تم إرسال كود التحقق - جارٍ الاستلام التلقائي..."}, to=uid)
 
-        # بدء مستمع الكود التلقائي في الخلفية
         try:
             asyncio.run_coroutine_threadsafe(
                 ud.client_manager._start_code_listener(),
@@ -962,11 +923,12 @@ def api_save_login():
         except Exception as cl_err:
             logger.warning(f"Code listener start error: {cl_err}")
 
-        return jsonify({"success": True, "message": "📱 تم إرسال كود التحقق إلى هاتفك", "status": "code_sent"})
+        return jsonify({"success": True, "message": "📱 تم إرسال كود التحقق", "status": "code_sent"})
 
     except Exception as e:
         logger.error(f"Login error: {e}")
-        return jsonify({"success": False, "message": f"❌ خطأ: {str(e)}"})
+        socketio.emit('log_update', {"message": f"❌ خطأ في تسجيل الدخول: {str(e)[:150]}"}, to=uid)
+        return jsonify({"success": False, "message": f"❌ خطأ: {str(e)[:150]}"})
 
 
 @app.route("/api/verify_code", methods=["POST"])
@@ -989,14 +951,22 @@ def api_verify_code():
             ud.client_manager.client.sign_in(ud.phone_number, code, phone_code_hash=ud.phone_code_hash)
         )
 
+        me = ud.client_manager.run_coroutine(ud.client_manager.client.get_me())
+        name = (me.first_name or '') + (' ' + (me.last_name or '') if me.last_name else '')
+        if not name.strip() and me.username:
+            name = f"@{me.username}"
+        elif not name.strip():
+            name = me.phone or str(me.id)
+
         with USERS_LOCK:
             ud.authenticated = True
             ud.connected = True
             ud.awaiting_code = False
+            ud.telegram_name = name
 
         ud.client_manager.run_coroutine(ud.client_manager._register_event_handlers())
         socketio.emit('log_update', {"message": "✅ تم تسجيل الدخول بنجاح"}, to=uid)
-        return jsonify({"success": True, "message": "✅ تم تسجيل الدخول بنجاح", "status": "success"})
+        return jsonify({"success": True, "message": "✅ تم تسجيل الدخول بنجاح", "status": "success", "telegram_name": name})
 
     except Exception as e:
         err_name = type(e).__name__
@@ -1034,14 +1004,22 @@ def api_verify_password():
             ud.client_manager.client.sign_in(password=password)
         )
 
+        me = ud.client_manager.run_coroutine(ud.client_manager.client.get_me())
+        name = (me.first_name or '') + (' ' + (me.last_name or '') if me.last_name else '')
+        if not name.strip() and me.username:
+            name = f"@{me.username}"
+        elif not name.strip():
+            name = me.phone or str(me.id)
+
         with USERS_LOCK:
             ud.authenticated = True
             ud.connected = True
             ud.awaiting_password = False
+            ud.telegram_name = name
 
         ud.client_manager.run_coroutine(ud.client_manager._register_event_handlers())
         socketio.emit('log_update', {"message": "✅ تم التحقق من كلمة المرور"}, to=uid)
-        return jsonify({"success": True, "message": "✅ تم تسجيل الدخول بنجاح"})
+        return jsonify({"success": True, "message": "✅ تم تسجيل الدخول بنجاح", "telegram_name": name})
 
     except Exception as e:
         err_name = type(e).__name__
@@ -1071,6 +1049,7 @@ def api_reset_login():
             ud.phone_code_hash = None
             ud.is_running = False
             ud.monitoring_active = False
+            ud.telegram_name = None
 
         socketio.emit('log_update', {"message": "🔓 تم تسجيل الخروج"}, to=uid)
         return jsonify({"success": True, "message": "✅ تم تسجيل الخروج"})
@@ -1172,23 +1151,17 @@ def api_reset_stats():
     return jsonify({"success": True, "message": "✅ تم إعادة تعيين الإحصائيات"})
 
 
-# ─── إدارة الرسائل المُرسلة جماعياً ───────────────────────────
-
 @app.route("/api/sent_batches", methods=["GET"])
 def api_sent_batches():
     uid = get_current_user_id()
     ud = get_or_create_user(uid)
     with USERS_LOCK:
         batches = list(ud.sent_batches)
-    # نُرجع بدون entries الكاملة لتخفيف الحجم (فقط العدد)
     result = []
     for b in reversed(batches):
         result.append({
-            "id": b["id"],
-            "text": b["text"],
-            "has_media": b.get("has_media", False),
-            "sent_at": b["sent_at"],
-            "edited_at": b.get("edited_at"),
+            "id": b["id"], "text": b["text"], "has_media": b.get("has_media", False),
+            "sent_at": b["sent_at"], "edited_at": b.get("edited_at"),
             "sent_count": b.get("sent_count", len(b["entries"])),
             "group_count": len(b["entries"]),
             "groups": [{"title": e["chat_title"], "username": e.get("chat_username")} for e in b["entries"]]
@@ -1212,15 +1185,12 @@ def api_edit_batch():
 
     def run_edit():
         try:
-            ud.client_manager.run_coroutine(
-                ud.client_manager._edit_batch_messages(batch_id, new_text),
-                timeout=120
-            )
+            ud.client_manager.run_coroutine(ud.client_manager._edit_batch_messages(batch_id, new_text), timeout=120)
         except Exception as e:
             socketio.emit('log_update', {"message": f"❌ خطأ في التعديل: {str(e)[:100]}"}, to=uid)
 
     threading.Thread(target=run_edit, daemon=True).start()
-    return jsonify({"success": True, "message": "⏳ جارٍ تعديل الرسائل في جميع المجموعات..."})
+    return jsonify({"success": True, "message": "⏳ جارٍ تعديل الرسائل..."})
 
 
 @app.route("/api/delete_batch", methods=["POST"])
@@ -1238,15 +1208,12 @@ def api_delete_batch():
 
     def run_delete():
         try:
-            ud.client_manager.run_coroutine(
-                ud.client_manager._delete_batch_messages(batch_id),
-                timeout=120
-            )
+            ud.client_manager.run_coroutine(ud.client_manager._delete_batch_messages(batch_id), timeout=120)
         except Exception as e:
             socketio.emit('log_update', {"message": f"❌ خطأ في الحذف: {str(e)[:100]}"}, to=uid)
 
     threading.Thread(target=run_delete, daemon=True).start()
-    return jsonify({"success": True, "message": "⏳ جارٍ حذف الرسائل من جميع المجموعات..."})
+    return jsonify({"success": True, "message": "⏳ جارٍ حذف الرسائل..."})
 
 
 @app.route("/api/send_now", methods=["POST"])
@@ -1262,17 +1229,11 @@ def api_send_now():
     groups = data.get('groups', [])
     message = data.get('message', '')
 
-    # إذا وُجد نص خام، استخرج المجموعات تلقائياً
     if raw_groups and not groups:
         groups = parse_entities(raw_groups)
 
     if not groups:
         return jsonify({"success": False, "message": "❌ لم يتم العثور على أي مجموعات صالحة"})
-
-    if not message:
-        settings = load_settings(uid)
-        if not settings.get('image_path'):
-            return jsonify({"success": False, "message": "❌ أدخل رسالة أو ارفع صورة"})
 
     settings = load_settings(uid)
     image_path = settings.get('image_path')
@@ -1301,29 +1262,22 @@ def api_start_monitoring():
     if not ud.authenticated:
         return jsonify({"success": False, "message": "❌ يجب تسجيل الدخول أولاً"})
 
-    # تحديث الإعدادات من القرص للحصول على أحدث الكلمات
     fresh_settings = load_settings(uid)
     with USERS_LOCK:
         ud.monitoring_active = True
         ud.is_running = True
-        ud.settings = fresh_settings  # ← تحديث الإعدادات في الذاكرة
+        ud.settings = fresh_settings
 
     watch_words = fresh_settings.get('watch_words', [])
 
-    # التأكد من تسجيل معالجات الأحداث إذا لم تكن مسجّلة
     if ud.client_manager and ud.client_manager.loop and not ud.client_manager.event_handlers_registered:
         try:
-            asyncio.run_coroutine_threadsafe(
-                ud.client_manager._register_event_handlers(),
-                ud.client_manager.loop
-            )
+            asyncio.run_coroutine_threadsafe(ud.client_manager._register_event_handlers(), ud.client_manager.loop)
             logger.info(f"Re-registered event handlers for {uid}")
         except Exception as reg_err:
             logger.warning(f"Could not register handlers: {reg_err}")
 
-    socketio.emit('log_update', {
-        "message": f"🚀 بدأت المراقبة - {len(watch_words)} كلمة مراقبة: {', '.join(watch_words[:5])}"
-    }, to=uid)
+    socketio.emit('log_update', {"message": f"🚀 بدأت المراقبة - {len(watch_words)} كلمة مراقبة: {', '.join(watch_words[:5])}"}, to=uid)
     socketio.emit('monitoring_status', {"is_running": True, "monitoring_active": True}, to=uid)
     return jsonify({"success": True, "message": f"✅ تم تشغيل المراقبة لـ {len(watch_words)} كلمة"})
 
@@ -1412,7 +1366,6 @@ def api_join_group():
 
 @app.route("/api/parse_join_links", methods=["POST"])
 def api_parse_join_links():
-    """فرز وترتيب روابط الانضمام"""
     data = request.json or {}
     raw = data.get('raw', '')
     entities = parse_entities(raw)
@@ -1439,7 +1392,6 @@ def api_parse_join_links():
 
 @app.route("/api/bulk_join", methods=["POST"])
 def api_bulk_join():
-    """الانضمام الجماعي لقائمة روابط مُفرَزة"""
     uid = get_current_user_id()
     ud = get_or_create_user(uid)
 
@@ -1464,9 +1416,7 @@ def api_bulk_join():
             try:
                 if entity_str.startswith('+'):
                     try:
-                        await ud.client_manager.client(
-                            functions.messages.ImportChatInviteRequest(hash=entity_str[1:])
-                        )
+                        await ud.client_manager.client(functions.messages.ImportChatInviteRequest(hash=entity_str[1:]))
                         ok += 1
                         msg = f"✅ [{i+1}/{total}] {label}"
                     except Exception as je:
@@ -1488,12 +1438,12 @@ def api_bulk_join():
                 socketio.emit('log_update', {"message": msg}, to=uid)
                 socketio.emit('join_progress', {"index": i+1, "total": total, "ok": ok, "skip": skip, "fail": fail}, to=uid)
                 await asyncio.sleep(2)
-
             except Exception as e:
                 fail += 1
                 err = str(e)
                 if 'Already' in err or 'USER_ALREADY' in err:
-                    skip += 1; fail -= 1
+                    skip += 1
+                    fail -= 1
                     socketio.emit('log_update', {"message": f"⚠️ [{i+1}/{total}] مسجّل: {label}"}, to=uid)
                 else:
                     socketio.emit('log_update', {"message": f"❌ [{i+1}/{total}] {label}: {err[:60]}"}, to=uid)
@@ -1501,9 +1451,7 @@ def api_bulk_join():
                 await asyncio.sleep(1)
 
         socketio.emit('bulk_join_done', {"ok": ok, "skip": skip, "fail": fail, "total": total}, to=uid)
-        socketio.emit('log_update', {
-            "message": f"🏁 اكتمل: ✅ {ok} | ⚠️ {skip} مسبقاً | ❌ {fail} فاشل من {total}"
-        }, to=uid)
+        socketio.emit('log_update', {"message": f"🏁 اكتمل: ✅ {ok} | ⚠️ {skip} مسبقاً | ❌ {fail} فاشل من {total}"}, to=uid)
 
     def run_bulk():
         try:
